@@ -1,0 +1,10 @@
+Flask
+requests
+openai
+discord.py
+pymongo
+python-dotenv
+discord
+matplotlib
+numpy
+urllib3<2.0

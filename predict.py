@@ -179,7 +179,7 @@ def get_detailed_recommendation_explanation(symbol, current_price, historical_pr
             followup = openai_client.chat.completions.create(
                 model="gpt-4o",
                 messages=[{"role": "user", "content": "Please continue your explanation to make it complete."}],
-                max_completion_tokens=150,
+                max_completion_tokens=300,
                 temperature=0.7,
             )
             extra = followup.choices[0].message.content.strip()

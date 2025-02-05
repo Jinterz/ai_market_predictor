@@ -29,5 +29,4 @@ venv/
 *.bak
 *.tmp
 
-*.pkl
 *.csv

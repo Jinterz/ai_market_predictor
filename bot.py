@@ -218,7 +218,7 @@ async def send_updates():
         await channel.send(embed=embed)
         print("Sent one stock summary.")
 
-    # Stream top 25 crypto summaries as embeds using the new async generator.
+    # Stream top 25 crypto summaries as embeds.
     await channel.send("**Live Top 25 Cryptos Summary (Past 30 Minutes):**")
     async for embed in async_generate_top25_crypto_summaries():
         await channel.send(embed=embed)

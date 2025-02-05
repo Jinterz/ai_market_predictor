@@ -28,3 +28,6 @@ venv/
 # Backup files
 *.bak
 *.tmp
+
+*.pkl
+*.csv

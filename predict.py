@@ -1,6 +1,6 @@
 # predict.py
-# This module handles data fetching, AI recommendation generation, chart plotting,
-# and analysis functions for both stocks and cryptocurrencies.
+# This module handles data fetching, AI recommendation generation (using both GPT and an ML model),
+# chart plotting, and analysis functions for both stocks and cryptocurrencies.
 #
 # NOTE: Yahoo Finance markup may change; adjust selectors in the news scraping functions as needed.
 
@@ -12,10 +12,16 @@ import io
 import logging
 import numpy as np
 import asyncio  # For async operations
+import joblib
+import pandas as pd
+from ta.momentum import RSIIndicator
+from ta.trend import SMAIndicator, MACD
 from openai import OpenAI  # OpenAI API client
 from dotenv import load_dotenv
 import plotly.graph_objects as go
 from bs4 import BeautifulSoup  # For web scraping
+import matplotlib.pyplot as plt  # For feature importance visualization
+from sklearn.metrics import confusion_matrix
 
 # Load environment variables.
 load_dotenv()
@@ -25,6 +31,10 @@ logging.basicConfig(level=logging.INFO)
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 ALPHA_VANTAGE_KEY = os.getenv("ALPHA_VANTAGE_KEY")
 FMP_API_KEY = os.getenv("FMP_API_KEY")  # For live stock activity
+
+# Load the trained ML model.
+# Use the model trained on S&P 500 data
+ml_model = joblib.load("rf_model_sp500.pkl")
 
 ### HELPER FUNCTIONS
 
@@ -53,7 +63,6 @@ def scrape_news_headlines(symbol, is_crypto=False):
     try:
         response = requests.get(url, timeout=10)
         soup = BeautifulSoup(response.text, "html.parser")
-        # Basic selector for headlines. Update if necessary.
         headlines = soup.find_all("h3", limit=2)
         results = []
         for h in headlines:
@@ -93,12 +102,58 @@ def fetch_crypto_data(symbol="bitcoin"):
         return response.json()
     return {"error": "Failed to fetch crypto data"}
 
+### ML MODEL FUNCTIONS
+
+def get_latest_data(symbol):
+    """
+    Dummy function to fetch the latest historical data for a given symbol.
+    Replace this with your data source. Here, we load data from a CSV file.
+    """
+    try:
+        df = pd.read_csv(f"{symbol}_daily.csv", index_col=0, parse_dates=True)
+        df.sort_index(inplace=True)
+        return df
+    except Exception as e:
+        logging.error(f"Error loading data for {symbol}: {e}")
+        return None
+
+def compute_technical_indicators(df):
+    """
+    Compute technical indicators on the provided DataFrame.
+    Returns the DataFrame with new features.
+    """
+    df["RSI"] = RSIIndicator(close=df["close"], window=14).rsi()
+    df["SMA50"] = SMAIndicator(close=df["close"], window=50).sma_indicator()
+    df["SMA20"] = SMAIndicator(close=df["close"], window=20).sma_indicator()
+    macd = MACD(close=df["close"])
+    df["MACD"] = macd.macd()
+    df["MACD_signal"] = macd.macd_signal()
+    return df
+
+def get_ml_recommendation(symbol):
+    """
+    Generate an ML-based recommendation by computing technical indicators
+    from the latest data and using the trained model.
+    """
+    df = get_latest_data(symbol)
+    if df is None or df.empty:
+        return f"Not enough data to compute technical indicators for {symbol}."
+    df = compute_technical_indicators(df)
+    latest = df.iloc[-1]
+    features = ["RSI", "SMA50", "SMA20", "MACD", "MACD_signal"]
+    if latest[features].isnull().any():
+        return f"Not enough data to compute technical indicators for {symbol}."
+    X_latest = latest[features].values.reshape(1, -1)
+    prediction = ml_model.predict(X_latest)[0]
+    return f"ML Model Recommendation for {symbol.upper()}: {prediction}"
+
 ### AI RECOMMENDATION FUNCTIONS
 
 def get_detailed_recommendation_explanation(symbol, current_price, historical_price, pct_change, ytd, mtd, wtd):
     """
     Call the OpenAI API to generate a detailed recommendation explanation.
     If the API call fails, a fallback explanation is provided.
+    Also checks if the explanation is complete; if not, sends a follow-up prompt.
     """
     prompt = (
         f"Using live data and recent market trends, analyze the following information for {symbol}:\n"
@@ -108,22 +163,29 @@ def get_detailed_recommendation_explanation(symbol, current_price, historical_pr
         f"- Year-to-Date Change: {ytd}%\n"
         f"- Month-to-Date Change: {mtd}%\n"
         f"- Week-to-Date Change: {wtd}%\n\n"
-        f"Based on this data and general market conditions, provide a detailed explanation on whether an investor should consider buying, holding, or selling this asset. Include any potential areas of focus for further research."
+        "Based on this data and general market conditions, provide a detailed explanation on whether an investor should consider buying, holding, or selling this asset. "
+        "Please ensure your explanation is complete and ends with a clear recommendation."
     )
     try:
         response = openai_client.chat.completions.create(
             model="gpt-4o",
             messages=[{"role": "user", "content": prompt}],
-            max_completion_tokens=250,
+            max_completion_tokens=200,
             temperature=0.7,
         )
-        logging.info(f"OpenAI raw response for {symbol}: {response}")
         explanation = response.choices[0].message.content.strip()
-        if not explanation:
-            raise ValueError("Empty explanation")
+        # Check if the explanation ends with proper punctuation; if not, ask to continue.
+        if not explanation.endswith((".", "!", "?")):
+            followup = openai_client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": "Please continue your explanation to make it complete."}],
+                max_completion_tokens=150,
+                temperature=0.7,
+            )
+            extra = followup.choices[0].message.content.strip()
+            explanation = explanation + " " + extra
     except Exception as e:
         logging.error(f"OpenAI explanation error for {symbol}: {e}")
-        # Fallback explanation
         if pct_change < -5:
             explanation = "The asset appears to be oversold based on recent price drops. Caution is advised."
         elif pct_change > 5:
@@ -134,27 +196,11 @@ def get_detailed_recommendation_explanation(symbol, current_price, historical_pr
 
 def get_ai_recommendation(symbol, market="stock"):
     """
-    Generate an AI recommendation based on live data.
-    Uses stock data for stocks and crypto data for cryptocurrencies.
+    Generate a recommendation. For stocks, use the ML model's output;
+    for crypto, fall back to the GPT-based explanation.
     """
     if market.lower() == "stock":
-        data = fetch_stock_data(symbol)
-        if "error" in data or "Time Series (Daily)" not in data:
-            return f"Error fetching data for {symbol}."
-        ts_data = data["Time Series (Daily)"]
-        sorted_dates = sorted(ts_data.keys())
-        last_30 = sorted_dates[-30:]
-        prices = [round(float(ts_data[d]["4. close"]), 2) for d in last_30]
-        pct_change = round(((prices[-1] - prices[-2]) / prices[-2]) * 100, 2) if len(prices) > 1 else 0
-        ytd, mtd, wtd = round(random.uniform(-10, 10), 2), round(random.uniform(-5, 5), 2), round(random.uniform(-3, 3), 2)
-        explanation = get_detailed_recommendation_explanation(symbol, prices[-1], prices[0], pct_change, ytd, mtd, wtd)
-        recommendation_text = (
-            f"**AI Recommendation for {symbol.upper()}**\n"
-            f"- Current Price: ${prices[-1]}\n"
-            f"- Daily % Change: {pct_change}%\n"
-            f"- Suggested Action: {explanation}"
-        )
-        return recommendation_text
+        return get_ml_recommendation(symbol)
     elif market.lower() == "crypto":
         data = fetch_crypto_data(symbol)
         if "error" in data or "prices" not in data:
@@ -164,15 +210,8 @@ def get_ai_recommendation(symbol, market="stock"):
         sampled = prices_data[::interval][:30]
         prices = [round(x[1], 2) for x in sampled]
         pct_change = round(((prices[-1] - prices[-2]) / prices[-2]) * 100, 2) if len(prices) > 1 else 0
-        ytd, mtd, wtd = round(random.uniform(-15, 15), 2), round(random.uniform(-7, 7), 2), round(random.uniform(-4, 4), 2)
-        explanation = get_detailed_recommendation_explanation(symbol, prices[-1], prices[0], pct_change, ytd, mtd, wtd)
-        recommendation_text = (
-            f"**AI Recommendation for {symbol.upper()}**\n"
-            f"- Current Price: ${prices[-1]}\n"
-            f"- Daily % Change: {pct_change}%\n"
-            f"- Suggested Action: {explanation}"
-        )
-        return recommendation_text
+        explanation = get_detailed_recommendation_explanation(symbol, prices[-1], prices[0], pct_change, 0, 0, 0)
+        return f"**AI Recommendation for {symbol.upper()}**\n- Current Price: ${prices[-1]}\n- Daily % Change: {pct_change}%\n- Suggested Action: {explanation}"
     else:
         return "Market type must be 'stock' or 'crypto'."
 
@@ -250,6 +289,10 @@ def analyze_stock_detailed(symbol):
     return summary, [price_chart_buf, pct_change_chart_buf]
 
 def analyze_crypto(symbol):
+    """
+    Perform detailed analysis on cryptocurrency data.
+    Returns a summary string and a list of chart buffers.
+    """
     data = fetch_crypto_data(symbol)
     if "error" in data or "prices" not in data:
         return f"Error fetching crypto data for {symbol}.", []
@@ -264,7 +307,7 @@ def analyze_crypto(symbol):
     moving_avg = np.convolve(prices_array, np.ones(7)/7, mode='valid') if len(prices) >= 7 else None
     price_chart_buf = plot_stock_price_trend(symbol, dates_dt, prices, moving_avg, timestamp)
     
-    # Fix: Avoid division by zero when computing percentage changes.
+    # Avoid division by zero when computing percentage changes.
     pct_changes = [0] + [
         round(((prices[i] - prices[i-1]) / prices[i-1]) * 100, 2) if prices[i-1] != 0 else 0
         for i in range(1, len(prices))
@@ -279,6 +322,7 @@ def analyze_crypto(symbol):
         f"**Live News**\n{news_summary}"
     )
     return summary, [price_chart_buf, pct_change_chart_buf]
+
 ### TOP 10 & TOP 25 FUNCTIONS
 
 def get_top10_stocks_30min():
@@ -315,12 +359,10 @@ def generate_top10_stock_graphs_30min():
     prices = [float(s.get("price", 0)) for s in stocks]
     ts = current_timestamp()
     buffers = []
-    # Chart for percentage change.
     fig = go.Figure()
     fig.add_trace(go.Bar(x=symbols, y=pct_changes, marker_color=['green' if ch >= 0 else 'red' for ch in pct_changes]))
     fig.update_layout(title=f"Top 10 Stocks % Change ({ts})", xaxis_title="Stock Symbol", yaxis_title="Daily % Change", template="plotly_dark")
     buffers.append(_save_figure_to_buffer(fig))
-    # Chart for current price.
     fig2 = go.Figure()
     fig2.add_trace(go.Bar(x=symbols, y=prices, marker_color='blue'))
     fig2.update_layout(title=f"Top 10 Stocks Price ({ts})", xaxis_title="Stock Symbol", yaxis_title="Price (USD)", template="plotly_dark")
@@ -453,7 +495,7 @@ def get_top25_crypto_30min():
         coin["recommendation"] = random.choice(["Buy", "Hold", "Sell"])
     return cryptos
 
-# NEW: Async generator to stream each top 25 crypto summary as an embed.
+# Async generator to stream each top 25 crypto summary as an embed.
 async def async_generate_top25_crypto_summaries():
     """
     For each of the top 25 cryptocurrencies, generate an embed with summary data.

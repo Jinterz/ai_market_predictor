@@ -1,6 +1,6 @@
 # audioop.py
-# This is a dummy audioop module. Only minimal functions are stubbed.
-# If any of these functions are called, a NotImplementedError will be raised.
+# Dummy module for audio operations.
+# All functions here are stubbed and will raise NotImplementedError if called.
 
 def _raise(*args, **kwargs):
     raise NotImplementedError("audioop is not available in this Python build.")
